@@ -130,102 +130,85 @@ class Http1Layer(_StreamingHttpLayer):
         layer()
 
 
-# TODO: The HTTP2 layer is missing multiplexing, which requires a major rewrite.
+
 class Http2Layer(_HttpLayer):
+    from h2.connection import H2Connection
+    from h2.events import (
+        RequestReceived, DataReceived, RemoteSettingsChanged, WindowUpdated
+    )
+
     def __init__(self, ctx, mode):
         super(Http2Layer, self).__init__(ctx)
         self.mode = mode
-        self.client_protocol = HTTP2Protocol(self.client_conn, is_server=True,
-                                             unhandled_frame_cb=self.handle_unexpected_frame_from_client)
-        self.server_protocol = HTTP2Protocol(self.server_conn, is_server=False,
-                                             unhandled_frame_cb=self.handle_unexpected_frame_from_server)
+
+        self.client_h2 = H2Connection(client_side=False)
+        self.server_h2 = H2Connection(client_side=True)
+
+        # make sure that we only pass actual SSL.Connection objects in here,
+        # because otherwise ssl_read_select fails!
+        self.active_conns = []
+
+        self.client_h2.initiate_connection()
+        self.client_conn.send(self.client_h2.data_to_send())
+        self.active_conns.append(self.client_conn.connection)
+
+        if self.server_conn:
+            self._initiate_server_conn()
 
     def read_request(self):
-        request = HTTPRequest.from_protocol(
-            self.client_protocol,
-            body_size_limit=self.config.body_size_limit
-        )
-        self._stream_id = request.stream_id
-        return request
+        pass
 
     def send_request(self, message):
-        # TODO: implement flow control and WINDOW_UPDATE frames
-        self.server_conn.send(self.server_protocol.assemble(message))
+        pass
 
     def read_response(self, request):
-        return HTTPResponse.from_protocol(
-            self.server_protocol,
-            request_method=request.method,
-            body_size_limit=self.config.body_size_limit,
-            include_body=True,
-            stream_id=self._stream_id
-        )
+        pass
 
     def send_response(self, message):
-        # TODO: implement flow control to prevent client buffer filling up
-        # maintain a send buffer size, and read WindowUpdateFrames from client to increase the send buffer
-        self.client_conn.send(self.client_protocol.assemble(message))
+        pass
 
     def check_close_connection(self, flow):
-        # TODO: add a timer to disconnect after a 10 second timeout
-        return False
+        pass
+
+    def _initiate_server_conn(self):
+        self.server_h2.initiate_connection()
+        self.server_conn.send(self.server_h2.data_to_send())
+        self.active_conns.append(self.server_conn.connection)
 
     def connect(self):
         self.ctx.connect()
-        self.server_protocol = HTTP2Protocol(self.server_conn, is_server=False,
-                                             unhandled_frame_cb=self.handle_unexpected_frame_from_server)
-        self.server_protocol.perform_connection_preface()
+        self.server_conn.connect()
+        self._initiate_server_conn()
 
-    def set_server(self, *args, **kwargs):
-        self.ctx.set_server(*args, **kwargs)
-        self.server_protocol = HTTP2Protocol(self.server_conn, is_server=False,
-                                             unhandled_frame_cb=self.handle_unexpected_frame_from_server)
-        self.server_protocol.perform_connection_preface()
+    def set_server(self):
+        raise NotImplementedError("Cannot change server for HTTP2 connections.")
+
+    def disconnect(self):
+        raise NotImplementedError("Cannot dis- or reconnect in HTTP2 connections.")
 
     def __call__(self):
-        self.server_protocol.perform_connection_preface()
-        layer = HttpLayer(self, self.mode)
-        layer()
+        try:
+            while True:
+                r = ssl_read_select(self.active_conns, 10)
+                for conn in r:
+                    source = client if conn == client.connection else server
+                    size = conn.recv_into(buf, self.chunk_size)
+                    if source == client:
+                        events = self.client_h2.receive_data(buf[:size].tobytes())
+                        if self.client_h2.data_to_send:
+                            self.client_conn.send(self.client_h2.data_to_send())
+                    else:
+                        events = self.server_h2.receive_data(buf[:size].tobytes())
+                        if self.server_h2.data_to_send:
+                            self.server_conn.send(self.server_h2.data_to_send())
 
-        # terminate the connection
-        self.client_conn.send(GoAwayFrame().to_bytes())
-
-    def handle_unexpected_frame_from_client(self, frame):
-        if isinstance(frame, WindowUpdateFrame):
-            # Clients are sending WindowUpdate frames depending on their flow control algorithm.
-            # Since we cannot predict these frames, and we do not need to respond to them,
-            # simply accept them, and hide them from the log.
-            # Ideally we should keep track of our own flow control window and
-            # stall transmission if the outgoing flow control buffer is full.
-            return
-        if isinstance(frame, PriorityFrame):
-            # Clients are sending Priority frames depending on their implementation.
-            # The RFC does not clearly state when or which priority preferences should be set.
-            # Since we cannot predict these frames, and we do not need to respond to them,
-            # simply accept them, and hide them from the log.
-            # Ideally we should forward them to the server.
-            return
-        if isinstance(frame, GoAwayFrame):
-            # Client wants to terminate the connection,
-            # relay it to the server.
-            self.server_conn.send(frame.to_bytes())
-            return
-        self.log("Unexpected HTTP2 frame from client: %s" % frame.human_readable(), "info")
-
-    def handle_unexpected_frame_from_server(self, frame):
-        if isinstance(frame, WindowUpdateFrame):
-            # Servers are sending WindowUpdate frames depending on their flow control algorithm.
-            # Since we cannot predict these frames, and we do not need to respond to them,
-            # simply accept them, and hide them from the log.
-            # Ideally we should keep track of our own flow control window and
-            # stall transmission if the outgoing flow control buffer is full.
-            return
-        if isinstance(frame, GoAwayFrame):
-            # Server wants to terminate the connection,
-            # relay it to the client.
-            self.client_conn.send(frame.to_bytes())
-            return
-        self.log("Unexpected HTTP2 frame from server: %s" % frame.human_readable(), "info")
+                for event in events:
+                    if isinstance(event, RequestReceived):
+                        self.requestReceived(event.headers, event.stream_id)
+                    if isinstance(event, ResponseReceived):
+                        self.requestReceived(event.headers, event.stream_id)
+                    elif isinstance(event, DataReceived):
+                        self.dataFrameReceived(event.stream_id)
 
 
 class ConnectServerConnection(object):
