@@ -16,17 +16,21 @@ from hyperframe import frame
 from h2.connection import H2Connection
 from h2.events import *
 
+from .base import Layer, Kill
 from .. import utils
 from ..exceptions import HttpProtocolException, ProtocolException
 from ..models import (
-    HTTPFlow, HTTPRequest, HTTPResponse, make_error_response, make_connect_response, Error, expect_continue_response
+    HTTPFlow,
+    HTTPRequest,
+    HTTPResponse,
+    make_error_response,
+    make_connect_response,
+    Error,
+    expect_continue_response
 )
-from .base import Layer, Kill
 
 
 class _HttpLayer(Layer):
-    supports_streaming = False
-
     def read_request(self):
         raise NotImplementedError()
 
@@ -37,37 +41,18 @@ class _HttpLayer(Layer):
         raise NotImplementedError()
 
     def read_response(self, request):
-        raise NotImplementedError()
-
-    def send_response(self, response):
-        raise NotImplementedError()
-
-    def check_close_connection(self, flow):
-        raise NotImplementedError()
-
-
-class _StreamingHttpLayer(_HttpLayer):
-    supports_streaming = True
-
-    def read_response_headers(self):
-        raise NotImplementedError
-
-    def read_response_body(self, request, response):
-        raise NotImplementedError()
-        yield "this is a generator"  # pragma: no cover
-
-    def read_response(self, request):
         response = self.read_response_headers()
         response.data.content = b"".join(
             self.read_response_body(request, response)
         )
         return response
 
-    def send_response_headers(self, response):
-        raise NotImplementedError
-
-    def send_response_body(self, response, chunks):
+    def read_response_headers(self):
         raise NotImplementedError()
+
+    def read_response_body(self, request, response):
+        raise NotImplementedError()
+        yield "this is a generator"  # pragma: no cover
 
     def send_response(self, response):
         if response.content == CONTENT_MISSING:
@@ -75,8 +60,17 @@ class _StreamingHttpLayer(_HttpLayer):
         self.send_response_headers(response)
         self.send_response_body(response, [response.content])
 
+    def send_response_headers(self, response):
+        raise NotImplementedError()
 
-class Http1Layer(_StreamingHttpLayer):
+    def send_response_body(self, response, chunks):
+        raise NotImplementedError()
+
+    def check_close_connection(self, flow):
+        raise NotImplementedError()
+
+
+class Http1Layer(_HttpLayer):
     def __init__(self, ctx, mode):
         super(Http1Layer, self).__init__(ctx)
         self.mode = mode
@@ -135,14 +129,11 @@ class Http1Layer(_StreamingHttpLayer):
         layer()
 
 
-class Http2Layer(_HttpLayer):
+class Http2Layer(Layer):
     def __init__(self, ctx, mode):
         super(Http2Layer, self).__init__(ctx)
         self.mode = mode
-
         self.streams = dict()
-
-        self.client_conn.h2 = H2Connection(client_side=False)
 
         # make sure that we only pass actual SSL.Connection objects in here,
         # because otherwise ssl_read_select fails!
@@ -152,6 +143,8 @@ class Http2Layer(_HttpLayer):
         preamble = self.client_conn.rfile.safe_read(24)
         if preamble != b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n':
             raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
+
+        self.client_conn.h2 = H2Connection(client_side=False)
         self.client_conn.h2.incoming_buffer._preamble_len = 0
         self.client_conn.h2.initiate_connection()
         self.client_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
@@ -234,7 +227,8 @@ class Http2Layer(_HttpLayer):
                 if self.streams[stream_id].zombie:
                     self.streams.pop(stream_id, None)
 
-class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
+
+class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
     def __init__(self, ctx, stream_id, request_headers):
         super(Http2SingleStreamLayer, self).__init__(ctx)
         self.zombie = False
@@ -245,6 +239,15 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
 
         self.response_arrived = threading.Event()
         self.data_finished = threading.Event()
+
+    def _send_body_chunked(self, conn, data):
+        max_outbound_frame_size = conn.h2.max_outbound_frame_size
+        for i in xrange(0, len(data), max_outbound_frame_size):
+            chunk = data[i:i+max_outbound_frame_size]
+            conn.h2.send_data(self.stream_id, chunk)
+            conn.send(self.server_conn.h2.data_to_send())
+        conn.h2.end_stream(self.stream_id)
+        conn.send(self.server_conn.h2.data_to_send())
 
     def read_request(self):
         self.data_finished.wait()
@@ -296,14 +299,8 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         )
 
     def send_request(self, message):
-        max_outbound_frame_size = self.server_conn.h2.max_outbound_frame_size
         self.server_conn.h2.send_headers(self.stream_id, message.headers)
-        for i in xrange(0, len(message.body), max_outbound_frame_size):
-            chunk = message.body[i:i+max_outbound_frame_size]
-            self.server_conn.h2.send_data(self.stream_id, chunk)
-            self.server_conn.send(self.server_conn.h2.data_to_send())
-        self.server_conn.h2.end_stream(self.stream_id)
-        self.server_conn.send(self.server_conn.h2.data_to_send())
+        self._send_body_chunked(self.server_conn, message.body)
 
     def read_response_headers(self):
         self.response_arrived.wait()
@@ -335,14 +332,8 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
     def send_response_body(self, response, chunks):
-        max_outbound_frame_size = self.client_conn.h2.max_outbound_frame_size
         for chunk in chunks:
-            for i in xrange(0, len(chunk), max_outbound_frame_size):
-                minichunk = chunk[i:i+max_outbound_frame_size]
-                self.client_conn.h2.send_data(self.stream_id, minichunk)
-                self.client_conn.send(self.client_conn.h2.data_to_send())
-        self.client_conn.h2.end_stream(self.stream_id)
-        self.client_conn.send(self.client_conn.h2.data_to_send())
+            self._send_body_chunked(self.client_conn, chunk)
 
     def check_close_connection(self, flow):
         # This layer only handles a single stream.
@@ -547,7 +538,7 @@ class HttpLayer(Layer):
         layer()
 
     def send_response_to_client(self, flow):
-        if not (self.supports_streaming and flow.response.stream):
+        if not flow.response.stream:
             # no streaming:
             # we already received the full response from the server and can
             # send it to the client straight away.
@@ -568,10 +559,7 @@ class HttpLayer(Layer):
     def get_response_from_server(self, flow):
         def get_response():
             self.send_request(flow.request)
-            if self.supports_streaming:
-                flow.response = self.read_response_headers()
-            else:
-                flow.response = self.read_response(flow.request)
+            flow.response = self.read_response_headers()
 
         try:
             get_response()
@@ -601,15 +589,14 @@ class HttpLayer(Layer):
         if flow == Kill:
             raise Kill()
 
-        if self.supports_streaming:
-            if flow.response.stream:
-                flow.response.data.content = CONTENT_MISSING
-            else:
-                flow.response.data.content = b"".join(self.read_response_body(
-                    flow.request,
-                    flow.response
-                ))
-            flow.response.timestamp_end = utils.timestamp()
+        if flow.response.stream:
+            flow.response.data.content = CONTENT_MISSING
+        else:
+            flow.response.data.content = b"".join(self.read_response_body(
+                flow.request,
+                flow.response
+            ))
+        flow.response.timestamp_end = utils.timestamp()
 
         # no further manipulation of self.server_conn beyond this point
         # we can safely set it as the final attribute value here.
