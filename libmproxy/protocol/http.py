@@ -1,16 +1,17 @@
 from __future__ import (absolute_import, print_function, division)
+
 import sys
 import traceback
-
 import six
+import struct
 
 from netlib import tcp
 from netlib.exceptions import HttpException, HttpReadDisconnect, NetlibException
-from netlib.http import http1, Headers
-from netlib.http import CONTENT_MISSING
-from netlib.tcp import Address
-from netlib.http.http2.connections import HTTP2Protocol
-from netlib.http.http2.frame import GoAwayFrame, PriorityFrame, WindowUpdateFrame
+from netlib.http import http1, Headers, CONTENT_MISSING
+from netlib.tcp import Address, ssl_read_select
+
+from h2.connection import H2Connection
+
 from .. import utils
 from ..exceptions import HttpProtocolException, ProtocolException
 from ..models import (
@@ -130,7 +131,6 @@ class Http1Layer(_StreamingHttpLayer):
         layer()
 
 
-
 class Http2Layer(_HttpLayer):
     from h2.connection import H2Connection
     from h2.events import (
@@ -187,29 +187,31 @@ class Http2Layer(_HttpLayer):
         raise NotImplementedError("Cannot dis- or reconnect in HTTP2 connections.")
 
     def __call__(self):
-        try:
-            while True:
-                r = ssl_read_select(self.active_conns, 10)
-                for conn in r:
-                    source = client if conn == client.connection else server
-                    size = conn.recv_into(buf, self.chunk_size)
-                    if source == client:
-                        events = self.client_h2.receive_data(buf[:size].tobytes())
-                        if self.client_h2.data_to_send:
-                            self.client_conn.send(self.client_h2.data_to_send())
-                    else:
-                        events = self.server_h2.receive_data(buf[:size].tobytes())
-                        if self.server_h2.data_to_send:
-                            self.server_conn.send(self.server_h2.data_to_send())
+        while True:
+            r = ssl_read_select(self.active_conns, 10)
+            for conn in r:
+                source = self.client_conn if conn == self.client_conn.connection else self.server_conn
 
-                for event in events:
-                    if isinstance(event, RequestReceived):
-                        self.requestReceived(event.headers, event.stream_id)
-                    if isinstance(event, ResponseReceived):
-                        self.requestReceived(event.headers, event.stream_id)
-                    elif isinstance(event, DataReceived):
-                        self.dataFrameReceived(event.stream_id)
+                fields = struct.unpack("!HB", source.rfile.peek(3))
+                length = (fields[0] << 8) + fields[1]
 
+                raw_frame = source.rfile.safe_read(9 + length)
+                if source == self.client_conn:
+                    events = self.client_h2.receive_data(raw_frame)
+                    if self.client_h2.data_to_send:
+                        self.client_conn.send(self.client_h2.data_to_send())
+                else:
+                    events = self.server_h2.receive_data(raw_frame)
+                    if self.server_h2.data_to_send:
+                        self.server_conn.send(self.server_h2.data_to_send())
+
+            for event in events:
+                if isinstance(event, RequestReceived):
+                    self.requestReceived(event.headers, event.stream_id)
+                if isinstance(event, ResponseReceived):
+                    self.requestReceived(event.headers, event.stream_id)
+                elif isinstance(event, DataReceived):
+                    self.dataFrameReceived(event.stream_id)
 
 class ConnectServerConnection(object):
     """
