@@ -206,6 +206,13 @@ class Http2Layer(_HttpLayer):
                     self.streams[event.stream_id].response_arrived.set()
                 elif isinstance(event, DataReceived):
                     self.streams[event.stream_id].data_queue.put(event.data)
+                    source_conn.h2.increment_flow_control_window(len(event.data))
+                    try:
+                        source_conn.h2.increment_flow_control_window(len(event.data), stream_id=event.stream_id)
+                    except:
+                        # TODO: find a better way to catch this:
+                        # ProtocolError: Invalid input StreamInputs.SEND_WINDOW_UPDATE in state StreamState.CLOSED
+                        pass
                 elif isinstance(event, StreamEnded):
                     self.streams[event.stream_id].data_finished.set()
                 elif isinstance(event, StreamReset):
@@ -312,9 +319,15 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             if self.data_finished.is_set():
                 break
 
-    def send_response(self, message):
-        self.client_conn.h2.send_headers(self.stream_id, message.headers)
-        self.client_conn.h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
+    def send_response_headers(self, response):
+        self.client_conn.h2.send_headers(self.stream_id, response.headers)
+        self.client_conn.send(self.client_conn.h2.data_to_send())
+
+    def send_response_body(self, response, chunks):
+        for chunk in chunks:
+            self.client_conn.h2.send_data(self.stream_id, chunk)
+            self.client_conn.send(self.client_conn.h2.data_to_send())
+        self.client_conn.h2.end_stream(self.stream_id)
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
     def check_close_connection(self, flow):
