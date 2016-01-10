@@ -12,7 +12,7 @@ from netlib.exceptions import HttpException, HttpReadDisconnect, NetlibException
 from netlib.http import http1, Headers, CONTENT_MISSING
 from netlib.tcp import Address, ssl_read_select
 
-from hyperframe.frame import Frame
+from hyperframe import frame
 from h2.connection import H2Connection
 from h2.events import *
 
@@ -154,6 +154,7 @@ class Http2Layer(_HttpLayer):
             raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
         self.client_conn.h2.incoming_buffer._preamble_len = 0
         self.client_conn.h2.initiate_connection()
+        self.client_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
         self.active_conns.append(self.client_conn.connection)
@@ -164,6 +165,7 @@ class Http2Layer(_HttpLayer):
     def _initiate_server_conn(self):
         self.server_conn.h2 = H2Connection(client_side=True)
         self.server_conn.h2.initiate_connection()
+        self.server_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
         self.server_conn.send(self.server_conn.h2.data_to_send())
         self.active_conns.append(self.server_conn.connection)
 
@@ -189,7 +191,11 @@ class Http2Layer(_HttpLayer):
                 length = (fields[0] << 8) + fields[1]
 
                 raw_frame = source_conn.rfile.safe_read(9 + length)
-                print("frame received: {}".format(Frame.parse_frame_header(raw_frame[0:9])))
+
+                foo = frame.Frame.parse_frame_header(raw_frame[0:9])
+                print("frame received: {}".format(foo))
+                if isinstance(foo[0], frame.GoAwayFrame):
+                    print(raw_frame[17:])
 
                 events = source_conn.h2.receive_data(raw_frame)
                 source_conn.send(source_conn.h2.data_to_send())
@@ -218,22 +224,15 @@ class Http2Layer(_HttpLayer):
                 elif isinstance(event, StreamReset):
                     self.streams[event.stream_id].zombie = True
                 elif isinstance(event, PushedStreamReceived):
-                    self.streams[event.pushed_stream_id] = Http2SingleStreamLayer(
-                        self,
-                        event.pushed_stream_id,
-                        Headers([[str(k), str(v)] for k, v in event.headers]))
-                    self.streams[event.pushed_stream_id].start()
-
-                    other_conn.h2.push_stream(event.parent_stream_id, event.pushed_stream_id, event.headers)
-                    other_conn.send(other_conn.h2.data_to_send())
+                    raise NotImplemented
                 elif isinstance(event, RemoteSettingsChanged):
                     source_conn.h2.acknowledge_settings(event)
                     new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
                     other_conn.h2.update_settings(new_settings)
 
-            # for stream_id in self.streams.keys():
-            #     if self.streams[stream_id].zombie:
-            #         self.streams.pop(stream_id, None)
+            for stream_id in self.streams.keys():
+                if self.streams[stream_id].zombie:
+                    self.streams.pop(stream_id, None)
 
 class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
     def __init__(self, ctx, stream_id, request_headers):
