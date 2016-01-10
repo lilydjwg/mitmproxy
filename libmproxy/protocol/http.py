@@ -218,7 +218,14 @@ class Http2Layer(_HttpLayer):
                 elif isinstance(event, StreamReset):
                     self.streams[event.stream_id].zombie = True
                 elif isinstance(event, PushedStreamReceived):
-                    raise NotImplementedError
+                    self.streams[event.pushed_stream_id] = Http2SingleStreamLayer(
+                        self,
+                        event.pushed_stream_id,
+                        Headers([[str(k), str(v)] for k, v in event.headers]))
+                    self.streams[event.pushed_stream_id].start()
+
+                    other_conn.h2.push_stream(event.parent_stream_id, event.pushed_stream_id, event.headers)
+                    other_conn.send(other_conn.h2.data_to_send())
                 elif isinstance(event, RemoteSettingsChanged):
                     source_conn.h2.acknowledge_settings(event)
                     new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
@@ -290,8 +297,13 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         )
 
     def send_request(self, message):
+        max_outbound_frame_size = self.server_conn.h2.max_outbound_frame_size
         self.server_conn.h2.send_headers(self.stream_id, message.headers)
-        self.server_conn.h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
+        for i in xrange(0, len(message.body), max_outbound_frame_size):
+            chunk = message.body[i:i+max_outbound_frame_size]
+            self.server_conn.h2.send_data(self.stream_id, chunk)
+            self.server_conn.send(self.server_conn.h2.data_to_send())
+        self.server_conn.h2.end_stream(self.stream_id)
         self.server_conn.send(self.server_conn.h2.data_to_send())
 
     def read_response_headers(self):
@@ -324,9 +336,12 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
     def send_response_body(self, response, chunks):
+        max_outbound_frame_size = self.client_conn.h2.max_outbound_frame_size
         for chunk in chunks:
-            self.client_conn.h2.send_data(self.stream_id, chunk)
-            self.client_conn.send(self.client_conn.h2.data_to_send())
+            for i in xrange(0, len(chunk), max_outbound_frame_size):
+                minichunk = chunk[i:i+max_outbound_frame_size]
+                self.client_conn.h2.send_data(self.stream_id, minichunk)
+                self.client_conn.send(self.client_conn.h2.data_to_send())
         self.client_conn.h2.end_stream(self.stream_id)
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
