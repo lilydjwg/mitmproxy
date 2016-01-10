@@ -4,13 +4,17 @@ import sys
 import traceback
 import six
 import struct
+import threading
+import Queue
 
 from netlib import tcp
 from netlib.exceptions import HttpException, HttpReadDisconnect, NetlibException
 from netlib.http import http1, Headers, CONTENT_MISSING
 from netlib.tcp import Address, ssl_read_select
 
+from hyperframe.frame import Frame
 from h2.connection import H2Connection
+from h2.events import (RequestReceived, ResponseReceived, DataReceived, StreamEnded)
 
 from .. import utils
 from ..exceptions import HttpProtocolException, ProtocolException
@@ -132,14 +136,11 @@ class Http1Layer(_StreamingHttpLayer):
 
 
 class Http2Layer(_HttpLayer):
-    from h2.connection import H2Connection
-    from h2.events import (
-        RequestReceived, DataReceived, RemoteSettingsChanged, WindowUpdated
-    )
-
     def __init__(self, ctx, mode):
         super(Http2Layer, self).__init__(ctx)
         self.mode = mode
+
+        self.streams = dict()
 
         self.client_h2 = H2Connection(client_side=False)
         self.server_h2 = H2Connection(client_side=True)
@@ -148,8 +149,14 @@ class Http2Layer(_HttpLayer):
         # because otherwise ssl_read_select fails!
         self.active_conns = []
 
+        # handle preamble manually so we can read pure frames later
+        preamble = self.client_conn.rfile.safe_read(24)
+        if preamble != b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n':
+            raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
+        self.client_h2.incoming_buffer._preamble_len = 0
         self.client_h2.initiate_connection()
         self.client_conn.send(self.client_h2.data_to_send())
+
         self.active_conns.append(self.client_conn.connection)
 
         if self.server_conn:
@@ -192,10 +199,14 @@ class Http2Layer(_HttpLayer):
             for conn in r:
                 source = self.client_conn if conn == self.client_conn.connection else self.server_conn
 
+                print(self.client_h2.data_to_send())
+
                 fields = struct.unpack("!HB", source.rfile.peek(3))
                 length = (fields[0] << 8) + fields[1]
 
                 raw_frame = source.rfile.safe_read(9 + length)
+                print("frame received: {}".format(Frame.parse_frame_header(raw_frame[0:9])))
+
                 if source == self.client_conn:
                     events = self.client_h2.receive_data(raw_frame)
                     if self.client_h2.data_to_send:
@@ -207,11 +218,118 @@ class Http2Layer(_HttpLayer):
 
             for event in events:
                 if isinstance(event, RequestReceived):
-                    self.requestReceived(event.headers, event.stream_id)
+                    print("Event: RequestReceived")
+                    self.streams[event.stream_id] = Http2SingleStreamLayer(
+                        self,
+                        event.stream_id,
+                        event.headers)
+                    self.streams[event.stream_id].start()
                 if isinstance(event, ResponseReceived):
+                    print("Event: ResponseReceived")
                     self.requestReceived(event.headers, event.stream_id)
                 elif isinstance(event, DataReceived):
-                    self.dataFrameReceived(event.stream_id)
+                    print("Event: DataReceived")
+                    self.streams[event.stream_id].data += event.data
+                elif isinstance(event, StreamEnded):
+                    print("Event: StreamEnded")
+                    self.streams[event.stream_id].data_finished.set()
+
+class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
+    def __init__(self, ctx, stream_id, headers):
+        super(Http2SingleStreamLayer, self).__init__(ctx)
+        self.stream_id = stream_id
+        self.headers = Headers(
+            [[str(k), str(v)] for k, v in headers]
+        )
+
+        self.data = b''
+        self.data_finished = threading.Event()
+
+    def read_request(self):
+        print("waiting...")
+        self.data_finished.wait()
+        print("done...")
+
+        authority = self.headers.get(':authority', '')
+        method = self.headers.get(':method', 'GET')
+        scheme = self.headers.get(':scheme', 'https')
+        path = self.headers.get(':path', '/')
+        host = None
+        port = None
+
+        if path == '*' or path.startswith("/"):
+            form_in = "relative"
+        elif method == 'CONNECT':
+            form_in = "authority"
+            if ":" in authority:
+                host, port = authority.split(":", 1)
+            else:
+                host = authority
+        else:
+            form_in = "absolute"
+            # FIXME: verify if path or :host contains what we need
+            scheme, host, port, _ = utils.parse_url(path)
+
+        if host is None:
+            host = 'localhost'
+        if port is None:
+            port = 80 if scheme == 'http' else 443
+        port = int(port)
+
+        request = HTTPRequest(
+            form_in,
+            method,
+            scheme,
+            host,
+            port,
+            path,
+            (2, 0),
+            self.headers,
+            self.data,
+            # TODO: timestamp_start=None,
+            # TODO: timestamp_end=None,
+            form_out=None, # TODO: (request.form_out if hasattr(request, 'form_out') else None),
+        )
+        print(request)
+        return request
+
+    def send_request(self, message):
+        self.server_h2.send_headers(self.stream_id, message.headers)
+        self.server_h2.send_data(self.stream_id, message.body)
+        self.server_conn.send(self.server_h2.data_to_send())
+
+    def read_response(self, request_method):
+        return HTTPResponse.from_protocol(
+            self.server_protocol,
+            request_method=request_method,
+            body_size_limit=self.config.body_size_limit,
+            include_body=True,
+            stream_id=self._stream_id,
+        )
+
+    def send_response(self, message):
+        # TODO: implement flow control to prevent client buffer filling up
+        # We need to maintain a send-buffer size, and read WindowUpdateFrames
+        # from the client to increase the send buffer.
+        message.stream_id = self._stream_id
+        self.client_protocol.send_response(message)
+
+    def check_close_connection(self, flow):
+        # This layer only handles a single stream.
+        # RFC 7540 8.1: An HTTP request/response exchange fully consumes a single stream.
+        return True
+
+    def connect(self):
+        raise ValueError("CONNECT inside an HTTP2 stream is not supported.")
+
+    def set_server(self, *args, **kwargs):
+        # do not mess with the server connection - all streams share it.
+        pass
+
+    def run(self):
+        layer = HttpLayer(self, self.mode)
+        layer()
+
 
 class ConnectServerConnection(object):
     """
