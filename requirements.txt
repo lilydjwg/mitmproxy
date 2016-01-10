@@ -1,3 +1,4 @@
 -e git+https://github.com/mitmproxy/netlib.git#egg=netlib
 -e git+https://github.com/mitmproxy/pathod.git#egg=pathod
+-e git+https://github.com/python-hyper/hyper-h2.git#egg=hyper-h2
 -e .[dev,examples,contentviews]

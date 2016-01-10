@@ -14,7 +14,14 @@ from netlib.tcp import Address, ssl_read_select
 
 from hyperframe.frame import Frame
 from h2.connection import H2Connection
-from h2.events import (RequestReceived, ResponseReceived, DataReceived, StreamEnded)
+from h2.events import (
+    RequestReceived,
+    ResponseReceived,
+    DataReceived,
+    StreamEnded,
+    StreamReset,
+    RemoteSettingsChanged
+)
 
 from .. import utils
 from ..exceptions import HttpProtocolException, ProtocolException
@@ -162,9 +169,6 @@ class Http2Layer(_HttpLayer):
         if self.server_conn:
             self._initiate_server_conn()
 
-    def check_close_connection(self, flow):
-        pass
-
     def _initiate_server_conn(self):
         self.server_h2.initiate_connection()
         self.server_conn.send(self.server_h2.data_to_send())
@@ -185,17 +189,15 @@ class Http2Layer(_HttpLayer):
         while True:
             r = ssl_read_select(self.active_conns, 10)
             for conn in r:
-                source = self.client_conn if conn == self.client_conn.connection else self.server_conn
+                source_conn = self.client_conn if conn == self.client_conn.connection else self.server_conn
+                source_h2 = self.client_h2 if conn == self.client_conn.connection else self.server_h2
 
-                print(self.client_h2.data_to_send())
-
-                fields = struct.unpack("!HB", source.rfile.peek(3))
+                fields = struct.unpack("!HB", source_conn.rfile.peek(3))
                 length = (fields[0] << 8) + fields[1]
 
-                raw_frame = source.rfile.safe_read(9 + length)
-                print("frame received: {}".format(Frame.parse_frame_header(raw_frame[0:9])))
+                raw_frame = source_conn.rfile.safe_read(9 + length)
 
-                if source == self.client_conn:
+                if source_conn == self.client_conn:
                     events = self.client_h2.receive_data(raw_frame)
                     if self.client_h2.data_to_send:
                         self.client_conn.send(self.client_h2.data_to_send())
@@ -206,26 +208,37 @@ class Http2Layer(_HttpLayer):
 
             for event in events:
                 if isinstance(event, RequestReceived):
-                    print("Event: RequestReceived")
                     self.streams[event.stream_id] = Http2SingleStreamLayer(
                         self,
                         event.stream_id,
                         Headers([[str(k), str(v)] for k, v in event.headers]))
                     self.streams[event.stream_id].start()
                 if isinstance(event, ResponseReceived):
-                    print("Event: ResponseReceived")
                     self.streams[event.stream_id].response_headers = Headers([[str(k), str(v)] for k, v in event.headers])
                     self.streams[event.stream_id].response_arrived.set()
                 elif isinstance(event, DataReceived):
-                    print("Event: DataReceived")
                     self.streams[event.stream_id].data.append(event.data)
                 elif isinstance(event, StreamEnded):
-                    print("Event: StreamEnded")
                     self.streams[event.stream_id].data_finished.set()
+                elif isinstance(event, StreamReset):
+                    self.streams[event.stream_id].zombie = True
+                elif isinstance(event, RemoteSettingsChanged):
+                    source_h2.acknowledge_settings(event)
+
+                    new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
+                    if source_conn == self.client_conn:
+                        self.server_h2.update_settings(new_settings)
+                    else:
+                        self.client_h2.update_settings(new_settings)
+
+            # for stream_id in self.streams.keys():
+            #     if self.streams[stream_id].zombie:
+            #         self.streams.pop(stream_id, None)
 
 class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
     def __init__(self, ctx, stream_id, request_headers):
         super(Http2SingleStreamLayer, self).__init__(ctx)
+        self.zombie = False
         self.stream_id = stream_id
         self.request_headers = request_headers
         self.response_headers = None
@@ -235,9 +248,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         self.data_finished = threading.Event()
 
     def read_request(self):
-        print("waiting...")
         self.data_finished.wait()
-        print("done...")
 
         authority = self.request_headers.get(':authority', '')
         method = self.request_headers.get(':method', 'GET')
@@ -265,7 +276,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             port = 80 if scheme == 'http' else 443
         port = int(port)
 
-        request = HTTPRequest(
+        return HTTPRequest(
             form_in,
             method,
             scheme,
@@ -279,18 +290,16 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             # TODO: timestamp_end=None,
             form_out=None, # TODO: (request.form_out if hasattr(request, 'form_out') else None),
         )
-        print(request)
-        return request
 
     def send_request(self, message):
         self.server_h2.send_headers(self.stream_id, message.headers)
-        self.server_h2.send_data(self.stream_id, b''.join(message.body))
+        self.server_h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
         self.server_conn.send(self.server_h2.data_to_send())
 
     def read_response_headers(self):
         self.response_arrived.wait()
 
-        response = HTTPResponse(
+        return HTTPResponse(
             http_version=(2, 0),
             status_code=int(self.response_headers.get(':status', 502)),
             reason='',
@@ -299,8 +308,6 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             # TODO: timestamp_start=response.timestamp_start,
             # TODO: timestamp_end=response.timestamp_end,
         )
-        print(response)
-        return response
 
     def read_response_body(self, request, response):
         self.data_finished.wait()
@@ -308,7 +315,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
 
     def send_response(self, message):
         self.client_h2.send_headers(self.stream_id, message.headers)
-        self.client_h2.send_data(self.stream_id, b''.join(message.body))
+        self.client_h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
         self.client_conn.send(self.client_h2.data_to_send())
 
     def check_close_connection(self, flow):
@@ -326,6 +333,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
     def run(self):
         layer = HttpLayer(self, self.mode)
         layer()
+        self.zombie = True
 
 
 class ConnectServerConnection(object):
