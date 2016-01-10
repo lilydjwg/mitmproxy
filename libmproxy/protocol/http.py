@@ -162,18 +162,6 @@ class Http2Layer(_HttpLayer):
         if self.server_conn:
             self._initiate_server_conn()
 
-    def read_request(self):
-        pass
-
-    def send_request(self, message):
-        pass
-
-    def read_response(self, request):
-        pass
-
-    def send_response(self, message):
-        pass
-
     def check_close_connection(self, flow):
         pass
 
@@ -222,27 +210,28 @@ class Http2Layer(_HttpLayer):
                     self.streams[event.stream_id] = Http2SingleStreamLayer(
                         self,
                         event.stream_id,
-                        event.headers)
+                        Headers([[str(k), str(v)] for k, v in event.headers]))
                     self.streams[event.stream_id].start()
                 if isinstance(event, ResponseReceived):
                     print("Event: ResponseReceived")
-                    self.requestReceived(event.headers, event.stream_id)
+                    self.streams[event.stream_id].response_headers = Headers([[str(k), str(v)] for k, v in event.headers])
+                    self.streams[event.stream_id].response_arrived.set()
                 elif isinstance(event, DataReceived):
                     print("Event: DataReceived")
-                    self.streams[event.stream_id].data += event.data
+                    self.streams[event.stream_id].data.append(event.data)
                 elif isinstance(event, StreamEnded):
                     print("Event: StreamEnded")
                     self.streams[event.stream_id].data_finished.set()
 
 class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
-    def __init__(self, ctx, stream_id, headers):
+    def __init__(self, ctx, stream_id, request_headers):
         super(Http2SingleStreamLayer, self).__init__(ctx)
         self.stream_id = stream_id
-        self.headers = Headers(
-            [[str(k), str(v)] for k, v in headers]
-        )
+        self.request_headers = request_headers
+        self.response_headers = None
+        self.data = []
 
-        self.data = b''
+        self.response_arrived = threading.Event()
         self.data_finished = threading.Event()
 
     def read_request(self):
@@ -250,10 +239,10 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         self.data_finished.wait()
         print("done...")
 
-        authority = self.headers.get(':authority', '')
-        method = self.headers.get(':method', 'GET')
-        scheme = self.headers.get(':scheme', 'https')
-        path = self.headers.get(':path', '/')
+        authority = self.request_headers.get(':authority', '')
+        method = self.request_headers.get(':method', 'GET')
+        scheme = self.request_headers.get(':scheme', 'https')
+        path = self.request_headers.get(':path', '/')
         host = None
         port = None
 
@@ -284,7 +273,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             port,
             path,
             (2, 0),
-            self.headers,
+            self.request_headers,
             self.data,
             # TODO: timestamp_start=None,
             # TODO: timestamp_end=None,
@@ -295,24 +284,32 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
 
     def send_request(self, message):
         self.server_h2.send_headers(self.stream_id, message.headers)
-        self.server_h2.send_data(self.stream_id, message.body)
+        self.server_h2.send_data(self.stream_id, b''.join(message.body))
         self.server_conn.send(self.server_h2.data_to_send())
 
-    def read_response(self, request_method):
-        return HTTPResponse.from_protocol(
-            self.server_protocol,
-            request_method=request_method,
-            body_size_limit=self.config.body_size_limit,
-            include_body=True,
-            stream_id=self._stream_id,
+    def read_response_headers(self):
+        self.response_arrived.wait()
+
+        response = HTTPResponse(
+            http_version=(2, 0),
+            status_code=int(self.response_headers.get(':status', 502)),
+            reason='',
+            headers=self.response_headers,
+            content=self.data,
+            # TODO: timestamp_start=response.timestamp_start,
+            # TODO: timestamp_end=response.timestamp_end,
         )
+        print(response)
+        return response
+
+    def read_response_body(self, request, response):
+        self.data_finished.wait()
+        return self.data
 
     def send_response(self, message):
-        # TODO: implement flow control to prevent client buffer filling up
-        # We need to maintain a send-buffer size, and read WindowUpdateFrames
-        # from the client to increase the send buffer.
-        message.stream_id = self._stream_id
-        self.client_protocol.send_response(message)
+        self.client_h2.send_headers(self.stream_id, message.headers)
+        self.client_h2.send_data(self.stream_id, b''.join(message.body))
+        self.client_conn.send(self.client_h2.data_to_send())
 
     def check_close_connection(self, flow):
         # This layer only handles a single stream.
