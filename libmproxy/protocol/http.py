@@ -14,14 +14,7 @@ from netlib.tcp import Address, ssl_read_select
 
 from hyperframe.frame import Frame
 from h2.connection import H2Connection
-from h2.events import (
-    RequestReceived,
-    ResponseReceived,
-    DataReceived,
-    StreamEnded,
-    StreamReset,
-    RemoteSettingsChanged
-)
+from h2.events import *
 
 from .. import utils
 from ..exceptions import HttpProtocolException, ProtocolException
@@ -196,15 +189,14 @@ class Http2Layer(_HttpLayer):
                 length = (fields[0] << 8) + fields[1]
 
                 raw_frame = source_conn.rfile.safe_read(9 + length)
+                print("frame received: {}".format(Frame.parse_frame_header(raw_frame[0:9])))
 
                 if source_conn == self.client_conn:
                     events = self.client_h2.receive_data(raw_frame)
-                    if self.client_h2.data_to_send:
-                        self.client_conn.send(self.client_h2.data_to_send())
+                    self.client_conn.send(self.client_h2.data_to_send())
                 else:
                     events = self.server_h2.receive_data(raw_frame)
-                    if self.server_h2.data_to_send:
-                        self.server_conn.send(self.server_h2.data_to_send())
+                    self.server_conn.send(self.server_h2.data_to_send())
 
             for event in events:
                 if isinstance(event, RequestReceived):
@@ -217,11 +209,13 @@ class Http2Layer(_HttpLayer):
                     self.streams[event.stream_id].response_headers = Headers([[str(k), str(v)] for k, v in event.headers])
                     self.streams[event.stream_id].response_arrived.set()
                 elif isinstance(event, DataReceived):
-                    self.streams[event.stream_id].data.append(event.data)
+                    self.streams[event.stream_id].data_queue.put(event.data)
                 elif isinstance(event, StreamEnded):
                     self.streams[event.stream_id].data_finished.set()
                 elif isinstance(event, StreamReset):
                     self.streams[event.stream_id].zombie = True
+                elif isinstance(event, PushedStreamReceived):
+                    raise NotImplementedError
                 elif isinstance(event, RemoteSettingsChanged):
                     source_h2.acknowledge_settings(event)
 
@@ -242,13 +236,14 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         self.stream_id = stream_id
         self.request_headers = request_headers
         self.response_headers = None
-        self.data = []
+        self.data_queue = Queue.Queue()
 
         self.response_arrived = threading.Event()
         self.data_finished = threading.Event()
 
     def read_request(self):
         self.data_finished.wait()
+        self.data_finished.clear()
 
         authority = self.request_headers.get(':authority', '')
         method = self.request_headers.get(':method', 'GET')
@@ -276,6 +271,10 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             port = 80 if scheme == 'http' else 443
         port = int(port)
 
+        data = []
+        while self.data_queue.qsize() > 0:
+            data.append(self.data_queue.get())
+
         return HTTPRequest(
             form_in,
             method,
@@ -285,7 +284,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             path,
             (2, 0),
             self.request_headers,
-            self.data,
+            data,
             # TODO: timestamp_start=None,
             # TODO: timestamp_end=None,
             form_out=None, # TODO: (request.form_out if hasattr(request, 'form_out') else None),
@@ -306,15 +305,19 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
             status_code=status_code,
             reason='',
             headers=self.response_headers,
-            content=self.data,
+            content=None,
             # TODO: timestamp_start=response.timestamp_start,
             # TODO: timestamp_end=response.timestamp_end,
         )
 
     def read_response_body(self, request, response):
-        self.data_finished.wait()
-        # TODO: make it really streaming
-        return self.data
+        while True:
+            try:
+                yield self.data_queue.get(timeout=5)
+            except:
+                pass
+            if self.data_finished.is_set():
+                break
 
     def send_response(self, message):
         self.client_h2.send_headers(self.stream_id, message.headers)
