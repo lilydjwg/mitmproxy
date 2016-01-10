@@ -223,9 +223,9 @@ class Http2Layer(Layer):
                     new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
                     other_conn.h2.update_settings(new_settings)
 
-            for stream_id in self.streams.keys():
-                if self.streams[stream_id].zombie:
-                    self.streams.pop(stream_id, None)
+            # for stream_id in self.streams.keys():
+            #     if self.streams[stream_id].zombie:
+            #         self.streams.pop(stream_id, None)
 
 
 class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
