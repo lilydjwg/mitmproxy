@@ -142,8 +142,7 @@ class Http2Layer(_HttpLayer):
 
         self.streams = dict()
 
-        self.client_h2 = H2Connection(client_side=False)
-        self.server_h2 = H2Connection(client_side=True)
+        self.client_conn.h2 = H2Connection(client_side=False)
 
         # make sure that we only pass actual SSL.Connection objects in here,
         # because otherwise ssl_read_select fails!
@@ -153,9 +152,9 @@ class Http2Layer(_HttpLayer):
         preamble = self.client_conn.rfile.safe_read(24)
         if preamble != b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n':
             raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
-        self.client_h2.incoming_buffer._preamble_len = 0
-        self.client_h2.initiate_connection()
-        self.client_conn.send(self.client_h2.data_to_send())
+        self.client_conn.h2.incoming_buffer._preamble_len = 0
+        self.client_conn.h2.initiate_connection()
+        self.client_conn.send(self.client_conn.h2.data_to_send())
 
         self.active_conns.append(self.client_conn.connection)
 
@@ -163,8 +162,9 @@ class Http2Layer(_HttpLayer):
             self._initiate_server_conn()
 
     def _initiate_server_conn(self):
-        self.server_h2.initiate_connection()
-        self.server_conn.send(self.server_h2.data_to_send())
+        self.server_conn.h2 = H2Connection(client_side=True)
+        self.server_conn.h2.initiate_connection()
+        self.server_conn.send(self.server_conn.h2.data_to_send())
         self.active_conns.append(self.server_conn.connection)
 
     def connect(self):
@@ -183,7 +183,7 @@ class Http2Layer(_HttpLayer):
             r = ssl_read_select(self.active_conns, 10)
             for conn in r:
                 source_conn = self.client_conn if conn == self.client_conn.connection else self.server_conn
-                source_h2 = self.client_h2 if conn == self.client_conn.connection else self.server_h2
+                other_conn = self.server_conn if conn == self.client_conn.connection else self.client_conn
 
                 fields = struct.unpack("!HB", source_conn.rfile.peek(3))
                 length = (fields[0] << 8) + fields[1]
@@ -191,12 +191,8 @@ class Http2Layer(_HttpLayer):
                 raw_frame = source_conn.rfile.safe_read(9 + length)
                 print("frame received: {}".format(Frame.parse_frame_header(raw_frame[0:9])))
 
-                if source_conn == self.client_conn:
-                    events = self.client_h2.receive_data(raw_frame)
-                    self.client_conn.send(self.client_h2.data_to_send())
-                else:
-                    events = self.server_h2.receive_data(raw_frame)
-                    self.server_conn.send(self.server_h2.data_to_send())
+                events = source_conn.h2.receive_data(raw_frame)
+                source_conn.send(source_conn.h2.data_to_send())
 
             for event in events:
                 if isinstance(event, RequestReceived):
@@ -217,13 +213,9 @@ class Http2Layer(_HttpLayer):
                 elif isinstance(event, PushedStreamReceived):
                     raise NotImplementedError
                 elif isinstance(event, RemoteSettingsChanged):
-                    source_h2.acknowledge_settings(event)
-
+                    source_conn.h2.acknowledge_settings(event)
                     new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
-                    if source_conn == self.client_conn:
-                        self.server_h2.update_settings(new_settings)
-                    else:
-                        self.client_h2.update_settings(new_settings)
+                    other_conn.h2.update_settings(new_settings)
 
             # for stream_id in self.streams.keys():
             #     if self.streams[stream_id].zombie:
@@ -291,9 +283,9 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         )
 
     def send_request(self, message):
-        self.server_h2.send_headers(self.stream_id, message.headers)
-        self.server_h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
-        self.server_conn.send(self.server_h2.data_to_send())
+        self.server_conn.h2.send_headers(self.stream_id, message.headers)
+        self.server_conn.h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
+        self.server_conn.send(self.server_conn.h2.data_to_send())
 
     def read_response_headers(self):
         self.response_arrived.wait()
@@ -311,6 +303,7 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
         )
 
     def read_response_body(self, request, response):
+        # TODO: fix race condition
         while True:
             try:
                 yield self.data_queue.get(timeout=5)
@@ -320,9 +313,9 @@ class Http2SingleStreamLayer(_StreamingHttpLayer, threading.Thread):
                 break
 
     def send_response(self, message):
-        self.client_h2.send_headers(self.stream_id, message.headers)
-        self.client_h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
-        self.client_conn.send(self.client_h2.data_to_send())
+        self.client_conn.h2.send_headers(self.stream_id, message.headers)
+        self.client_conn.h2.send_data(self.stream_id, b''.join(message.body), end_stream=True)
+        self.client_conn.send(self.client_conn.h2.data_to_send())
 
     def check_close_connection(self, flow):
         # This layer only handles a single stream.
