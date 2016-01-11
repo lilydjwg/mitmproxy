@@ -144,22 +144,20 @@ class SafeH2Connection(H2Connection):
                 # ProtocolError: Invalid input StreamInputs.SEND_WINDOW_UPDATE in state StreamState.CLOSED
                 pass
 
-    def safe_send_transmission(self, stream_id, headers, body):
-        self.safe_send_headers(stream_id, headers)
-        self.safe_send_body(stream_id, body)
-
     def safe_send_headers(self, stream_id, headers):
         with self.lock:
             self.send_headers(stream_id, headers)
             self.conn.send(self.data_to_send())
 
-    def safe_send_body(self, stream_id, data):
-        with self.lock:
+    def safe_send_body(self, stream_id, chunks):
+        for chunk in chunks:
             max_outbound_frame_size = self.max_outbound_frame_size
-            for i in xrange(0, len(data), max_outbound_frame_size):
-                chunk = data[i:i+max_outbound_frame_size]
-                self.send_data(stream_id, chunk)
-                self.conn.send(self.data_to_send())
+            for i in xrange(0, len(chunk), max_outbound_frame_size):
+                frame_chunk = chunk[i:i+max_outbound_frame_size]
+                with self.lock:
+                    self.send_data(stream_id, frame_chunk)
+                    self.conn.send(self.data_to_send())
+        with self.lock:
             self.end_stream(stream_id)
             self.conn.send(self.data_to_send())
 
@@ -243,8 +241,9 @@ class Http2Layer(Layer):
                     self.streams[event.stream_id].data_finished.set()
                 elif isinstance(event, StreamReset):
                     self.streams[event.stream_id].zombie = True
-                elif isinstance(event, PushedStreamReceived):
-                    raise NotImplemented
+                    with other_conn.h2.lock:
+                        other_conn.h2.reset_stream(event.stream_id, event.error_code)
+                        other_conn.send(other_conn.h2.data_to_send())
                 elif isinstance(event, RemoteSettingsChanged):
                     with source_conn.h2.lock:
                         source_conn.h2.acknowledge_settings(event)
@@ -253,6 +252,8 @@ class Http2Layer(Layer):
                     with other_conn.h2.lock:
                         other_conn.h2.update_settings(new_settings)
                         other_conn.send(other_conn.h2.data_to_send())
+                elif isinstance(event, PushedStreamReceived):
+                    raise NotImplementedError()
 
             # for stream_id in self.streams.keys():
             #     if self.streams[stream_id].zombie:
@@ -321,9 +322,12 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
         )
 
     def send_request(self, message):
-        self.server_conn.h2.safe_send_transmission(
+        self.server_conn.h2.safe_send_headers(
             self.stream_id,
-            message.headers,
+            message.headers
+        )
+        self.server_conn.h2.safe_send_body(
+            self.stream_id,
             message.body
         )
 
@@ -359,11 +363,10 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
         )
 
     def send_response_body(self, _response, chunks):
-        for chunk in chunks:
-            self.client_conn.h2.safe_send_body(
-                self.stream_id,
-                chunk
-            )
+        self.client_conn.h2.safe_send_body(
+            self.stream_id,
+            chunks
+        )
 
     def check_close_connection(self, flow):
         # This layer only handles a single stream.
