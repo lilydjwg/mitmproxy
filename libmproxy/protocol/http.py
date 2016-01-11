@@ -194,14 +194,10 @@ class Http2Layer(Layer):
         raise NotImplementedError("Cannot dis- or reconnect in HTTP2 connections.")
 
     def __call__(self):
-        # handle preamble manually so we can read pure frames later
-        preamble = self.client_conn.rfile.safe_read(24)
-        if preamble != b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n':
-            raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
-
-        self.client_conn.h2.incoming_buffer._preamble_len = 0
+        preamble = self.client_conn.rfile.read(24)
         self.client_conn.h2.initiate_connection()
         self.client_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
+        self.client_conn.h2.receive_data(preamble)
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
         while True:
@@ -212,7 +208,6 @@ class Http2Layer(Layer):
 
                 fields = struct.unpack("!HB", source_conn.rfile.peek(3))
                 length = (fields[0] << 8) + fields[1]
-
                 raw_frame = source_conn.rfile.safe_read(9 + length)
 
                 foo = frame.Frame.parse_frame_header(raw_frame[0:9])
