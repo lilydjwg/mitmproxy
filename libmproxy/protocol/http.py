@@ -12,9 +12,10 @@ from netlib.exceptions import HttpException, HttpReadDisconnect, NetlibException
 from netlib.http import http1, Headers, CONTENT_MISSING
 from netlib.tcp import Address, ssl_read_select
 
-from hyperframe import frame
+import h2
 from h2.connection import H2Connection
 from h2.events import *
+from hyperframe import frame
 
 from .base import Layer, Kill
 from .. import utils
@@ -128,35 +129,56 @@ class Http1Layer(_HttpLayer):
         layer = HttpLayer(self, self.mode)
         layer()
 
+class SafeH2Connection(H2Connection):
+    def __init__(self, conn, *args, **kwargs):
+        super(SafeH2Connection, self).__init__(*args, **kwargs)
+        self.conn = conn
+        self.lock = threading.Lock()
+
+    def safe_increment_flow_control(self, stream_id, length):
+        with self.lock:
+            self.increment_flow_control_window(length)
+            try:
+                self.increment_flow_control_window(length, stream_id=stream_id)
+            except h2.exceptions.ProtocolError:
+                # ProtocolError: Invalid input StreamInputs.SEND_WINDOW_UPDATE in state StreamState.CLOSED
+                pass
+
+    def safe_send_transmission(self, stream_id, headers, body):
+        self.safe_send_headers(stream_id, headers)
+        self.safe_send_body(stream_id, body)
+
+    def safe_send_headers(self, stream_id, headers):
+        with self.lock:
+            self.send_headers(stream_id, headers)
+            self.conn.send(self.data_to_send())
+
+    def safe_send_body(self, stream_id, data):
+        with self.lock:
+            max_outbound_frame_size = self.max_outbound_frame_size
+            for i in xrange(0, len(data), max_outbound_frame_size):
+                chunk = data[i:i+max_outbound_frame_size]
+                self.send_data(stream_id, chunk)
+                self.conn.send(self.data_to_send())
+            self.end_stream(stream_id)
+            self.conn.send(self.data_to_send())
 
 class Http2Layer(Layer):
     def __init__(self, ctx, mode):
         super(Http2Layer, self).__init__(ctx)
         self.mode = mode
         self.streams = dict()
+        self.client_conn.h2 = SafeH2Connection(self.client_conn, client_side=False)
 
         # make sure that we only pass actual SSL.Connection objects in here,
         # because otherwise ssl_read_select fails!
-        self.active_conns = []
-
-        # handle preamble manually so we can read pure frames later
-        preamble = self.client_conn.rfile.safe_read(24)
-        if preamble != b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n':
-            raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
-
-        self.client_conn.h2 = H2Connection(client_side=False)
-        self.client_conn.h2.incoming_buffer._preamble_len = 0
-        self.client_conn.h2.initiate_connection()
-        self.client_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
-        self.client_conn.send(self.client_conn.h2.data_to_send())
-
-        self.active_conns.append(self.client_conn.connection)
+        self.active_conns = [self.client_conn.connection]
 
         if self.server_conn:
             self._initiate_server_conn()
 
     def _initiate_server_conn(self):
-        self.server_conn.h2 = H2Connection(client_side=True)
+        self.server_conn.h2 = SafeH2Connection(self.server_conn, client_side=True)
         self.server_conn.h2.initiate_connection()
         self.server_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
         self.server_conn.send(self.server_conn.h2.data_to_send())
@@ -174,6 +196,16 @@ class Http2Layer(Layer):
         raise NotImplementedError("Cannot dis- or reconnect in HTTP2 connections.")
 
     def __call__(self):
+        # handle preamble manually so we can read pure frames later
+        preamble = self.client_conn.rfile.safe_read(24)
+        if preamble != b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n':
+            raise ValueError("HTTP2 preamble does not match: {}".format(preamble.encode('hex')))
+
+        self.client_conn.h2.incoming_buffer._preamble_len = 0
+        self.client_conn.h2.initiate_connection()
+        self.client_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
+        self.client_conn.send(self.client_conn.h2.data_to_send())
+
         while True:
             r = ssl_read_select(self.active_conns, 10)
             for conn in r:
@@ -190,8 +222,9 @@ class Http2Layer(Layer):
                 if isinstance(foo[0], frame.GoAwayFrame):
                     print(raw_frame[17:])
 
-                events = source_conn.h2.receive_data(raw_frame)
-                source_conn.send(source_conn.h2.data_to_send())
+                with source_conn.h2.lock:
+                    events = source_conn.h2.receive_data(raw_frame)
+                    source_conn.send(source_conn.h2.data_to_send())
 
             for event in events:
                 if isinstance(event, RequestReceived):
@@ -205,13 +238,7 @@ class Http2Layer(Layer):
                     self.streams[event.stream_id].response_arrived.set()
                 elif isinstance(event, DataReceived):
                     self.streams[event.stream_id].data_queue.put(event.data)
-                    source_conn.h2.increment_flow_control_window(len(event.data))
-                    try:
-                        source_conn.h2.increment_flow_control_window(len(event.data), stream_id=event.stream_id)
-                    except:
-                        # TODO: find a better way to catch this:
-                        # ProtocolError: Invalid input StreamInputs.SEND_WINDOW_UPDATE in state StreamState.CLOSED
-                        pass
+                    source_conn.h2.safe_increment_flow_control(event.stream_id, len(event.data))
                 elif isinstance(event, StreamEnded):
                     self.streams[event.stream_id].data_finished.set()
                 elif isinstance(event, StreamReset):
@@ -219,9 +246,13 @@ class Http2Layer(Layer):
                 elif isinstance(event, PushedStreamReceived):
                     raise NotImplemented
                 elif isinstance(event, RemoteSettingsChanged):
-                    source_conn.h2.acknowledge_settings(event)
+                    with source_conn.h2.lock:
+                        source_conn.h2.acknowledge_settings(event)
+                        source_conn.send(source_conn.h2.data_to_send())
                     new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
-                    other_conn.h2.update_settings(new_settings)
+                    with other_conn.h2.lock:
+                        other_conn.h2.update_settings(new_settings)
+                        other_conn.send(other_conn.h2.data_to_send())
 
             # for stream_id in self.streams.keys():
             #     if self.streams[stream_id].zombie:
@@ -239,15 +270,6 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
 
         self.response_arrived = threading.Event()
         self.data_finished = threading.Event()
-
-    def _send_body_chunked(self, conn, data):
-        max_outbound_frame_size = conn.h2.max_outbound_frame_size
-        for i in xrange(0, len(data), max_outbound_frame_size):
-            chunk = data[i:i+max_outbound_frame_size]
-            conn.h2.send_data(self.stream_id, chunk)
-            conn.send(self.server_conn.h2.data_to_send())
-        conn.h2.end_stream(self.stream_id)
-        conn.send(self.server_conn.h2.data_to_send())
 
     def read_request(self):
         self.data_finished.wait()
@@ -299,8 +321,11 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
         )
 
     def send_request(self, message):
-        self.server_conn.h2.send_headers(self.stream_id, message.headers)
-        self._send_body_chunked(self.server_conn, message.body)
+        self.server_conn.h2.safe_send_transmission(
+            self.stream_id,
+            message.headers,
+            message.body
+        )
 
     def read_response_headers(self):
         self.response_arrived.wait()
@@ -328,12 +353,17 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
                 break
 
     def send_response_headers(self, response):
-        self.client_conn.h2.send_headers(self.stream_id, response.headers)
-        self.client_conn.send(self.client_conn.h2.data_to_send())
+        self.client_conn.h2.safe_send_headers(
+            self.stream_id,
+            response.headers
+        )
 
-    def send_response_body(self, response, chunks):
+    def send_response_body(self, _response, chunks):
         for chunk in chunks:
-            self._send_body_chunked(self.client_conn, chunk)
+            self.client_conn.h2.safe_send_body(
+                self.stream_id,
+                chunk
+            )
 
     def check_close_connection(self, flow):
         # This layer only handles a single stream.
