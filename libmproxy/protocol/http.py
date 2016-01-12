@@ -166,6 +166,7 @@ class Http2Layer(Layer):
         super(Http2Layer, self).__init__(ctx)
         self.mode = mode
         self.streams = dict()
+        self.server_to_client_stream_ids = dict([(0, 0)])
         self.client_conn.h2 = SafeH2Connection(self.client_conn, client_side=False)
 
         # make sure that we only pass actual SSL.Connection objects in here,
@@ -211,34 +212,47 @@ class Http2Layer(Layer):
                 raw_frame = source_conn.rfile.safe_read(9 + length)
 
                 foo = frame.Frame.parse_frame_header(raw_frame[0:9])
-                print("frame received: {}".format(foo))
+                # print("frame received: {}".format(foo))
                 if isinstance(foo[0], frame.GoAwayFrame):
-                    print(raw_frame[17:])
+                    print("GOAWAY reason: ".format(raw_frame[17:]))
 
                 with source_conn.h2.lock:
                     events = source_conn.h2.receive_data(raw_frame)
                     source_conn.send(source_conn.h2.data_to_send())
 
             for event in events:
+                if hasattr(event, 'stream_id'):
+                    if source_conn == self.client_conn:
+                        eid = event.stream_id
+                    else:
+                        eid = self.server_to_client_stream_ids[event.stream_id]
+
                 if isinstance(event, RequestReceived):
-                    self.streams[event.stream_id] = Http2SingleStreamLayer(
+                    self.streams[eid] = Http2SingleStreamLayer(
                         self,
-                        event.stream_id,
+                        eid,
                         Headers([[str(k), str(v)] for k, v in event.headers]))
-                    self.streams[event.stream_id].start()
-                if isinstance(event, ResponseReceived):
-                    self.streams[event.stream_id].response_headers = Headers([[str(k), str(v)] for k, v in event.headers])
-                    self.streams[event.stream_id].response_arrived.set()
+                    self.streams[eid].start()
+                elif isinstance(event, ResponseReceived):
+                    self.streams[eid].response_headers = Headers([[str(k), str(v)] for k, v in event.headers])
+                    self.streams[eid].response_arrived.set()
                 elif isinstance(event, DataReceived):
-                    self.streams[event.stream_id].data_queue.put(event.data)
+                    self.streams[eid].data_queue.put(event.data)
                     source_conn.h2.safe_increment_flow_control(event.stream_id, len(event.data))
                 elif isinstance(event, StreamEnded):
-                    self.streams[event.stream_id].data_finished.set()
+                    self.streams[eid].data_finished.set()
                 elif isinstance(event, StreamReset):
-                    self.streams[event.stream_id].zombie = True
-                    with other_conn.h2.lock:
-                        other_conn.h2.reset_stream(event.stream_id, event.error_code)
-                        other_conn.send(other_conn.h2.data_to_send())
+                    if eid in self.streams:
+                        self.streams[eid].zombie = True
+
+                        if other_conn == self.server_conn:
+                            other_stream_id = self.server_to_client_stream_ids[eid]
+                        else:
+                            other_stream_id = eid
+
+                        with other_conn.h2.lock:
+                            other_conn.h2.reset_stream(other_stream_id, event.error_code)
+                            other_conn.send(other_conn.h2.data_to_send())
                 elif isinstance(event, RemoteSettingsChanged):
                     with source_conn.h2.lock:
                         source_conn.h2.acknowledge_settings(event)
@@ -249,6 +263,8 @@ class Http2Layer(Layer):
                         other_conn.send(other_conn.h2.data_to_send())
                 elif isinstance(event, PushedStreamReceived):
                     raise NotImplementedError()
+                else:
+                    print(event)
 
             # for stream_id in self.streams.keys():
             #     if self.streams[stream_id].zombie:
@@ -259,7 +275,8 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
     def __init__(self, ctx, stream_id, request_headers):
         super(Http2SingleStreamLayer, self).__init__(ctx)
         self.zombie = False
-        self.stream_id = stream_id
+        self.client_stream_id = stream_id
+        self.server_stream_id = None
         self.request_headers = request_headers
         self.response_headers = None
         self.data_queue = Queue.Queue()
@@ -317,14 +334,21 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
         )
 
     def send_request(self, message):
-        self.server_conn.h2.safe_send_headers(
-            self.stream_id,
-            message.headers
-        )
-        self.server_conn.h2.safe_send_body(
-            self.stream_id,
-            message.body
-        )
+        with self.server_conn.h2.lock:
+            self.server_stream_id = self.server_conn.h2.get_next_available_stream_id()
+            self.server_to_client_stream_ids[self.server_stream_id] = self.client_stream_id
+
+            if self.server_stream_id != self.client_stream_id:
+                print("Mapped {} -> {}".format(self.server_stream_id, self.client_stream_id))
+
+            self.server_conn.h2.safe_send_headers(
+                self.server_stream_id,
+                message.headers
+            )
+            self.server_conn.h2.safe_send_body(
+                self.server_stream_id,
+                message.body
+            )
 
     def read_response_headers(self):
         self.response_arrived.wait()
@@ -353,13 +377,13 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
 
     def send_response_headers(self, response):
         self.client_conn.h2.safe_send_headers(
-            self.stream_id,
+            self.client_stream_id,
             response.headers
         )
 
     def send_response_body(self, _response, chunks):
         self.client_conn.h2.safe_send_body(
-            self.stream_id,
+            self.client_stream_id,
             chunks
         )
 
