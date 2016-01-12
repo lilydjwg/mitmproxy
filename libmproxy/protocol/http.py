@@ -133,7 +133,7 @@ class SafeH2Connection(H2Connection):
     def __init__(self, conn, *args, **kwargs):
         super(SafeH2Connection, self).__init__(*args, **kwargs)
         self.conn = conn
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
 
     def safe_increment_flow_control(self, stream_id, length):
         with self.lock:
