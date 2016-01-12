@@ -144,6 +144,21 @@ class SafeH2Connection(H2Connection):
                 self.increment_flow_control_window(length, stream_id=stream_id)
                 self.conn.send(self.data_to_send())
 
+    def safe_reset_stream(self, stream_id, error_code):
+        with self.lock:
+            self.reset_stream(stream_id, error_code)
+            self.conn.send(self.h2.data_to_send())
+
+    def safe_acknowledge_settings(self, event):
+        with self.conn.h2.lock:
+            self.conn.h2.acknowledge_settings(event)
+            self.conn.send(self.data_to_send())
+
+    def safe_update_settings(self, new_settings):
+        with self.conn.h2.lock:
+            self.update_settings(new_settings)
+            self.conn.send(self.data_to_send())
+
     def safe_send_headers(self, stream_id, headers):
         with self.lock:
             self.send_headers(stream_id, headers)
@@ -218,10 +233,10 @@ class Http2Layer(Layer):
 
                 for event in events:
                     if hasattr(event, 'stream_id'):
-                        if source_conn == self.client_conn:
-                            eid = event.stream_id
-                        else:
+                        if is_server:
                             eid = self.server_to_client_stream_ids[event.stream_id]
+                        else:
+                            eid = event.stream_id
 
                     if isinstance(event, RequestReceived):
                         headers = Headers([[str(k), str(v)] for k, v in event.headers])
@@ -240,27 +255,19 @@ class Http2Layer(Layer):
                         self.streams[eid].zombie = True
                         if eid in self.streams and event.error_code == 0x8:
                             if is_server:
-                                other_stream_id = self.server_to_client_stream_ids[eid]
+                                other_stream_id = self.streams[eid].client_stream_id
                             else:
                                 other_stream_id = self.streams[eid].server_stream_id
-
-                            with other_conn.h2.lock:
-                                other_conn.h2.reset_stream(other_stream_id, event.error_code)
-                                other_conn.send(other_conn.h2.data_to_send())
+                            other_conn.h2.safe_reset_stream(other_stream_id, event.error_code)
                     elif isinstance(event, RemoteSettingsChanged):
-                        with source_conn.h2.lock:
-                            source_conn.h2.acknowledge_settings(event)
-                            source_conn.send(source_conn.h2.data_to_send())
+                        source_conn.h2.safe_acknowledge_settings(event)
                         new_settings = dict([(id, cs.new_value) for (id, cs) in event.changed_settings.iteritems()])
-                        with other_conn.h2.lock:
-                            other_conn.h2.update_settings(new_settings)
-                            other_conn.send(other_conn.h2.data_to_send())
-                    elif isinstance(event, PushedStreamReceived):
-                        raise NotImplementedError()
+                        other_conn.h2.safe_update_settings(new_settings)
 
-                # for stream_id in self.streams.keys():
-                #     if self.streams[stream_id].zombie:
-                #         self.streams.pop(stream_id, None)
+            # TODO: cleanup resources once we are sure nobody needs them
+            # for stream_id in self.streams.keys():
+            #     if self.streams[stream_id].zombie:
+            #         self.streams.pop(stream_id, None)
 
 
 class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
