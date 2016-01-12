@@ -145,13 +145,11 @@ class SafeH2Connection(H2Connection):
                 self.conn.send(self.data_to_send())
 
     def safe_send_headers(self, stream_id, headers):
-        print("{}: sending headers".format(stream_id))
         with self.lock:
             self.send_headers(stream_id, headers)
             self.conn.send(self.data_to_send())
 
     def safe_send_body(self, stream_id, chunks):
-        print("{}: sending body".format(stream_id))
         for chunk in chunks:
             max_outbound_frame_size = self.max_outbound_frame_size
             for i in xrange(0, len(chunk), max_outbound_frame_size):
@@ -203,9 +201,6 @@ class Http2Layer(Layer):
         self.client_conn.h2.receive_data(preamble)
         self.client_conn.send(self.client_conn.h2.data_to_send())
 
-        self.incoming_requests = 0
-        self.served_requests = 0
-
         while True:
             r = ssl_read_select(self.active_conns, 1)
             for conn in r:
@@ -216,13 +211,6 @@ class Http2Layer(Layer):
                 fields = struct.unpack("!HB", source_conn.rfile.peek(3))
                 length = (fields[0] << 8) + fields[1]
                 raw_frame = source_conn.rfile.safe_read(9 + length)
-
-                foo = frame.Frame.parse_frame_header(raw_frame[0:9])
-                print("{}: {}".format(("server->mitmproxy" if is_server else "client->mitmproxy"), foo))
-                if isinstance(foo[0], frame.GoAwayFrame):
-                    print("GOAWAY reason: {}".format(raw_frame[17:]))
-                if isinstance(foo[0], frame.RstStreamFrame):
-                    print("error_code: {}".format(raw_frame[9:].encode('hex')))
 
                 with source_conn.h2.lock:
                     events = source_conn.h2.receive_data(raw_frame)
@@ -236,7 +224,6 @@ class Http2Layer(Layer):
                             eid = self.server_to_client_stream_ids[event.stream_id]
 
                     if isinstance(event, RequestReceived):
-                        self.incoming_requests += 1
                         headers = Headers([[str(k), str(v)] for k, v in event.headers])
                         self.streams[eid] = Http2SingleStreamLayer(self, eid, headers)
                         self.streams[eid].start()
@@ -270,14 +257,6 @@ class Http2Layer(Layer):
                             other_conn.send(other_conn.h2.data_to_send())
                     elif isinstance(event, PushedStreamReceived):
                         raise NotImplementedError()
-                    elif isinstance(event, PriorityUpdated):
-                        pass
-                    elif isinstance(event, WindowUpdated):
-                        pass
-                    elif isinstance(event, SettingsAcknowledged):
-                        pass
-                    else:
-                        print(event)
 
                 # for stream_id in self.streams.keys():
                 #     if self.streams[stream_id].zombie:
@@ -351,9 +330,6 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
             self.server_stream_id = self.server_conn.h2.get_next_available_stream_id()
             self.server_to_client_stream_ids[self.server_stream_id] = self.client_stream_id
 
-            if self.server_stream_id != self.client_stream_id:
-                print("Mapped {} -> {}".format(self.server_stream_id, self.client_stream_id))
-
             self.server_conn.h2.safe_send_headers(
                 self.server_stream_id,
                 message.headers
@@ -417,7 +393,6 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
         layer = HttpLayer(self, self.mode)
         layer()
         self.zombie = True
-        self.ctx.served_requests += 1
 
 
 class ConnectServerConnection(object):
