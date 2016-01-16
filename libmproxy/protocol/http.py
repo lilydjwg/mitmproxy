@@ -130,6 +130,7 @@ class Http1Layer(_HttpLayer):
         layer = HttpLayer(self, self.mode)
         layer()
 
+
 class SafeH2Connection(H2Connection):
     def __init__(self, conn, *args, **kwargs):
         super(SafeH2Connection, self).__init__(*args, **kwargs)
@@ -201,6 +202,7 @@ class SafeH2Connection(H2Connection):
                 return
             self.end_stream(stream_id)
             self.conn.send(self.data_to_send())
+
 
 class Http2Layer(Layer):
     def __init__(self, ctx, mode):
