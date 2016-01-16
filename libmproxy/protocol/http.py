@@ -269,19 +269,18 @@ class Http2Layer(Layer):
                         if isinstance(event, RequestReceived):
                             headers = Headers([[str(k), str(v)] for k, v in event.headers])
                             self.streams[eid] = Http2SingleStreamLayer(self, eid, headers)
-                            self.timestamp_start = event.timestamp_start
-                            self.timestamp_end = event.timestamp_end
+                            self.streams[eid].timestamp_start = time.time()
                             self.streams[eid].start()
                         elif isinstance(event, ResponseReceived):
                             headers = Headers([[str(k), str(v)] for k, v in event.headers])
-                            self.timestamp_start = event.timestamp_start
-                            self.timestamp_end = event.timestamp_end
+                            self.streams[eid].timestamp_start = time.time()
                             self.streams[eid].response_headers = headers
                             self.streams[eid].response_arrived.set()
                         elif isinstance(event, DataReceived):
                             self.streams[eid].data_queue.put(event.data)
                             source_conn.h2.safe_increment_flow_control(event.stream_id, len(event.data))
                         elif isinstance(event, StreamEnded):
+                            self.streams[eid].timestamp_end = time.time()
                             self.streams[eid].data_finished.set()
                         elif isinstance(event, StreamReset):
                             self.streams[eid].zombie = time.time()
