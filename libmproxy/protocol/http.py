@@ -269,9 +269,13 @@ class Http2Layer(Layer):
                         if isinstance(event, RequestReceived):
                             headers = Headers([[str(k), str(v)] for k, v in event.headers])
                             self.streams[eid] = Http2SingleStreamLayer(self, eid, headers)
+                            self.timestamp_start = event.timestamp_start
+                            self.timestamp_end = event.timestamp_end
                             self.streams[eid].start()
                         elif isinstance(event, ResponseReceived):
                             headers = Headers([[str(k), str(v)] for k, v in event.headers])
+                            self.timestamp_start = event.timestamp_start
+                            self.timestamp_end = event.timestamp_end
                             self.streams[eid].response_headers = headers
                             self.streams[eid].response_arrived.set()
                         elif isinstance(event, DataReceived):
@@ -375,8 +379,8 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
             (2, 0),
             self.request_headers,
             data,
-            # TODO: timestamp_start=None,
-            # TODO: timestamp_end=None,
+            timestamp_start=self.timestamp_start,
+            timestamp_end=self.timestamp_end,
             form_out=None, # TODO: (request.form_out if hasattr(request, 'form_out') else None),
         )
 
@@ -407,8 +411,8 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
             reason='',
             headers=self.response_headers,
             content=None,
-            # TODO: timestamp_start=response.timestamp_start,
-            # TODO: timestamp_end=response.timestamp_end,
+            timestamp_start=self.timestamp_start,
+            timestamp_end=self.timestamp_end,
         )
 
     def read_response_body(self, request, response):
