@@ -216,9 +216,6 @@ class Http2Layer(Layer):
         # because otherwise ssl_read_select fails!
         self.active_conns = [self.client_conn.connection]
 
-        if self.server_conn:
-            self._initiate_server_conn()
-
     def _initiate_server_conn(self):
         self.server_conn.h2 = SafeH2Connection(self.server_conn, client_side=True)
         self.server_conn.h2.initiate_connection()
@@ -237,7 +234,15 @@ class Http2Layer(Layer):
     def disconnect(self):
         raise NotImplementedError("Cannot dis- or reconnect in HTTP2 connections.")
 
+    def next_layer(self):
+        # WebSockets over HTTP/2?
+        # CONNECT for proxying?
+        raise NotImplementedError()
+
     def __call__(self):
+        if self.server_conn:
+            self._initiate_server_conn()
+
         preamble = self.client_conn.rfile.read(24)
         self.client_conn.h2.initiate_connection()
         self.client_conn.h2.update_settings({frame.SettingsFrame.ENABLE_PUSH: False})
