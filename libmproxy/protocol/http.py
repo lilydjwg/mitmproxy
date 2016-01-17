@@ -327,6 +327,7 @@ class Http2SingleStreamLayer(_HttpLayer, threading.Thread):
             return True
 
         try:
+            # TODO: replace private API call
             h2_conn._get_stream_by_id(stream_id)
         except Exception as e:
             if isinstance(e, h2.exceptions.StreamClosedError):
