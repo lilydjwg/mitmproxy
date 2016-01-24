@@ -88,6 +88,8 @@ class RootContext(object):
                 return Http2Layer(top_layer, 'transparent')
             if alpn == b'http/1.1':
                 return Http1Layer(top_layer, 'transparent')
+            else:
+                raise NotImplementedError("Unknown ALP negotiated: %s" % alpn)
 
         # 6. Check for raw tcp mode
         is_ascii = (
